@@ -2,7 +2,7 @@ import os
 
 from omegaconf import OmegaConf
 os.environ['MUJOCO_GL'] = 'egl'
-
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
 import mediapy as media
 import matplotlib.pyplot as plt
 
@@ -25,6 +25,10 @@ from brax.io import html, mjcf, model
 from brax.mjx.base import State as MjxState
 from agents.ppo import networks as ppo_networks
 from agents.ppo import train as ppo
+from agents.gmmppo import networks as gmmppo_networks
+from agents.gmmppo import train as gmmppo
+from agents.flowppo import networks as flowppo_networks
+from agents.flowppo import train as flowppo
 from agents.sac import networks as sac_networks
 from agents.sac import train as sac
 from agents.td3 import networks as td3_networks
@@ -177,6 +181,12 @@ def train_ppo(cfg:dict, randomization_fn, env, eval_env=None):
     else:
         wandb_name = f"{cfg.task}.{cfg.policy}.{cfg.seed}.asym={cfg.asymmetric_critic}.eval_rand={cfg.eval_randomization}"
     wandb_name += cfg.comment
+    if cfg.randomization:
+        wandb_name = f"{cfg.task}.{cfg.policy}.{cfg.seed}.asym={cfg.asymmetric_critic}"
+        if cfg.custom_wrapper and cfg.adv_wrapper:
+            wandb_name+=f".adv_wrapper={cfg.adv_wrapper}"#dr_train_ratio={cfg.dr_train_ratio}"
+    else:
+        wandb_name = f"{cfg.task}.{cfg.policy}.{cfg.seed}.asym={cfg.asymmetric_critic}.eval_rand={cfg.eval_randomization}"
     if cfg.use_wandb:
         wandb.init(
             project=cfg.wandb_project, 
@@ -187,24 +197,38 @@ def train_ppo(cfg:dict, randomization_fn, env, eval_env=None):
         )
         wandb.config.update({"env_name": cfg.task})
     ppo_training_params = dict(ppo_params)
-    network_factory = ppo_networks.make_ppo_networks
+    if cfg.policy=='ppo':
+        network_factory = ppo_networks.make_ppo_networks
+        train_fn = ppo.train
+    elif cfg.policy=="gmmppo":
+        network_factory = gmmppo_networks.make_gmmppo_networks
+        train_fn = gmmppo.train
+    elif cfg.policy=="flowppo":
+        network_factory = flowppo_networks.make_flowppo_networks
+        train_fn = flowppo.train
     if "network_factory" in ppo_params:
         del ppo_training_params["network_factory"]
         if not cfg.asymmetric_critic:
             ppo_params.network_factory.value_obs_key = "state"
         network_factory = functools.partial(
-            ppo_networks.make_ppo_networks,
+            network_factory,
             **ppo_params.network_factory
         )
         
     progress = functools.partial(progress_fn, use_wandb=cfg.use_wandb)
-
+    if cfg.custom_wrapper:
+        randomizer = registry.get_domain_randomizer_eval(cfg.task)
+    else:
+        randomizer = randomization_fn
     train_fn = functools.partial(
-        ppo.train, **dict(ppo_training_params),
+        train_fn, **dict(ppo_training_params),
         network_factory=network_factory,
         progress_fn=progress,
         policy_params_fn=functools.partial(policy_params_fn, ckpt_path=cfg.work_dir / "models" ),
-        randomization_fn=randomization_fn,
+        randomization_fn=randomizer,
+        eval_randomization_fn = randomization_fn,
+        adv_wrapper = cfg.adv_wrapper,
+        use_wandb=cfg.use_wandb,
         seed=cfg.seed,
         # custom_wrapper = cfg.custom_wrapper
     )
@@ -673,7 +697,7 @@ def train(cfg: dict):
         make_inference_fn, params, metrics = train_sac(cfg, randomization_fn, env)
     if cfg.policy == "td3":
         make_inference_fn, params, metrics = train_td3(cfg, randomization_fn, env)
-    elif cfg.policy == "ppo":
+    elif "ppo" in cfg.policy:
         make_inference_fn, params, metrics = train_ppo(cfg, randomization_fn, env)
     elif cfg.policy == "flowsac":
         make_inference_fn, params, metrics = train_flowsac(cfg, randomization_fn, env)
@@ -737,7 +761,7 @@ def train(cfg: dict):
         frames = np.stack(frames).transpose(0, 3, 1, 2)
         fps=1.0 / env.dt
         rewards = jnp.asarray(reward_list)
-        wandb.log({'final_eval_reward' : rewards.mean()})
+        wandb.log({'final_eval_reward' : rewards.mean()}) 
         wandb.log({'final_eval_reward_iqm' : scipy.stats.trim_mean(rewards, proportiontocut=0.25, axis=None) })
         wandb.log({'final_eval_reward_std' :rewards.std() })
         wandb.log({'eval_video': wandb.Video(frames, fps=fps, format='mp4')})

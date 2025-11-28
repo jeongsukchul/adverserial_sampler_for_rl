@@ -47,7 +47,6 @@ def setup_weight_update_fn(gmm_wrapper: GMMWrapper, TEMPERATURE, USE_SELF_NORMAL
             importance_weights = jnp.exp(log_weights)                # [# of Components, Batch_size]
             importance_weights = mask[None, :] * importance_weights
             expected_log_ratios = jnp.dot(importance_weights, log_ratios)      #[# of Components]
-            
         else:
             n = jnp.array(jnp.shape(samples)[0], jnp.float32)
             log_importance_weights = component_log_densities - background_mixture_densities

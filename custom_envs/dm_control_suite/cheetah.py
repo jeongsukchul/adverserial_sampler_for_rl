@@ -174,8 +174,8 @@ class Run(mjx_env.MjxEnv):
   def dr_range(self) -> dict:
 
     low = jp.array(
-        [0.1] +                             #floor_friction_min 
-        [0.1] 
+        [0.8] +                             #floor_friction_min 
+        [0.8] 
         #[0.1] 
       )
         # [0.] * (self.mjx_model.nv - 3) +   # dof_friction_min
@@ -204,10 +204,10 @@ def domain_randomize(model: mjx.Model, dr_range, params=None, rng:jax.Array=None
     idx = 0
     geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(params[idx])
     idx += 1
-    body_mass = model.body_mass.at[TORSO_BODY_ID].set(params[idx])
-    idx+=1
-    # body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(params[idx])
+    # body_mass = model.body_mass.at[TORSO_BODY_ID].set(params[idx])
     # idx+=1
+    body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(params[idx])
+    idx+=1
     # geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(params[idx])
     # idx+=1
     # dof_frictionloss = model.dof_frictionloss.at[3:].set(params[idx:idx+ model.nv-3])
@@ -237,10 +237,10 @@ def domain_randomize(model: mjx.Model, dr_range, params=None, rng:jax.Array=None
     idx = 0
     geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(rng_params[idx])
     idx += 1
-    body_mass = model.body_mass.at[TORSO_BODY_ID].set(rng_params[idx])
-    idx+=1
-    # body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(rng_params[idx])
+    # body_mass = model.body_mass.at[TORSO_BODY_ID].set(rng_params[idx])
     # idx+=1
+    body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(rng_params[idx])
+    idx+=1
     # idx = 0
     # geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(rng_params[idx])
     # idx += 1
@@ -309,10 +309,10 @@ def domain_randomize_eval(model: mjx.Model, dr_range, params=None, rng:jax.Array
     idx = 0
     geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(params[idx])
     idx += 1
-    body_mass = model.body_mass.at[TORSO_BODY_ID].set(params[idx])
-    idx+=1
-    # body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(params[idx])
+    # body_mass = model.body_mass.at[TORSO_BODY_ID].set(params[idx])
     # idx+=1
+    body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(params[idx])
+    idx+=1
     # idx = 0
     # geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(params[idx])
     # idx += 1
@@ -341,10 +341,10 @@ def domain_randomize_eval(model: mjx.Model, dr_range, params=None, rng:jax.Array
     idx = 0
     geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(rng_params[idx])
     idx += 1
-    body_mass = model.body_mass.at[TORSO_BODY_ID].set(rng_params[idx])
-    idx+=1
-    # body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(rng_params[idx])
+    # body_mass = model.body_mass.at[TORSO_BODY_ID].set(rng_params[idx])
     # idx+=1
+    body_mass = model.body_mass.at[BTHIGH_BODY_ID].set(rng_params[idx])
+    idx+=1
     # idx=0
     # geom_friction = model.geom_friction.at[FLOOR_GEOM_ID, 0].set(
     #   rng_params[idx]

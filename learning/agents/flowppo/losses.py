@@ -20,20 +20,21 @@ See: https://arxiv.org/pdf/1707.06347.pdf
 from typing import Any, Tuple
 
 from brax.training import types
-from agents.ppo import networks as ppo_networks
+from agents.flowppo import networks as flowppo_networks
 from brax.training.types import Params
 import flax
 import jax
 import jax.numpy as jnp
+from learning.module import networks
+from learning.module.gmmvi.network import GMMTrainingState
 
 
 @flax.struct.dataclass
-class PPONetworkParams:
+class FLOWPPONetworkParams:
   """Contains training state for the learner."""
-
   policy: Params
   value: Params
-
+  flow: Params
 
 def compute_gae(
     truncation: jnp.ndarray,
@@ -100,12 +101,12 @@ def compute_gae(
   return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
 
 
-def compute_ppo_loss(
-    params: PPONetworkParams,
+def compute_flowppo_loss(
+    params: FLOWPPONetworkParams,
     normalizer_params: Any,
     data: types.Transition,
     rng: jnp.ndarray,
-    ppo_network: ppo_networks.PPONetworks,
+    flowppo_network: flowppo_networks.FLOWPPONetworks,
     entropy_cost: float = 1e-4,
     discounting: float = 0.9,
     reward_scaling: float = 1.0,
@@ -113,7 +114,7 @@ def compute_ppo_loss(
     clipping_epsilon: float = 0.3,
     normalize_advantage: bool = True,
 ) -> Tuple[jnp.ndarray, types.Metrics]:
-  """Computes PPO loss.
+  """Computes FLOWPPO loss.
 
   Args:
     params: Network parameters,
@@ -122,7 +123,7 @@ def compute_ppo_loss(
       are ['state_extras']['truncation'] ['policy_extras']['raw_action']
       ['policy_extras']['log_prob']
     rng: Random key
-    ppo_network: PPO networks.
+    flowppo_network: FLOWPPO networks.
     entropy_cost: entropy cost.
     discounting: discounting,
     reward_scaling: reward multiplier.
@@ -133,9 +134,9 @@ def compute_ppo_loss(
   Returns:
     A tuple (loss, metrics)
   """
-  parametric_action_distribution = ppo_network.parametric_action_distribution
-  policy_apply = ppo_network.policy_network.apply
-  value_apply = ppo_network.value_network.apply
+  parametric_action_distribution = flowppo_network.parametric_action_distribution
+  policy_apply = flowppo_network.policy_network.apply
+  value_apply = flowppo_network.value_network.apply
 
   # Put the time dimension first.
   data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
@@ -155,6 +156,7 @@ def compute_ppo_loss(
       policy_logits, data.extras['policy_extras']['raw_action']
   )
   behaviour_action_log_probs = data.extras['policy_extras']['log_prob']
+
   vs, advantages = compute_gae(
       truncation=truncation,
       termination=termination,
@@ -184,9 +186,45 @@ def compute_ppo_loss(
   entropy_loss = entropy_cost * -entropy
 
   total_loss = policy_loss + v_loss + entropy_loss
-  return total_loss, { # add surrogate loss function for target_pdf function in PPO
+  return total_loss, {
       'total_loss': total_loss,
       'policy_loss': policy_loss,
       'v_loss': v_loss,
       'entropy_loss': entropy_loss,
+  }
+def flow_loss(
+    params: Params,
+    dynamics_params: jnp.ndarray,
+    target_lnpdf: Any,
+    key: jax.random.PRNGKey,
+    flowppo_network :flowppo_networks.FLOWPPONetworks,
+    dr_range_high,
+    dr_range_low,
+    lmbda_params:Params,
+):
+  """Loss for training the flow network to generate adversarial dynamics parameters."""
+  # If dr_low/dr_high are 1-D (shape: [D]) → scalar
+  data_log_prob = flowppo_network.flow_network.apply(
+      params.flow,
+      low=dr_range_low,
+      high=dr_range_high,
+      mode='log_prob',
+      x=dynamics_params,
+  )
+  data_log_prob = jnp.clip(data_log_prob, -1e6, 1e6)
+  _, current_logp = flowppo_network.flow_network.apply(
+      params.flow,
+      mode='sample',
+      low=dr_range_low,
+      high=dr_range_high,
+      rng=key,
+      n_samples=10000,
+  )
+  kl_loss = current_logp.mean()
+  # Get next action and log prob from policy for adversarial observation
+  value_loss = target_lnpdf.mean()
+  # return lmbda_params* value_loss + kl_loss, (env_state, buffer_state, normalizer_params, noise_scales, simul_info, value_loss, kl_loss)
+  return lmbda_params * value_loss +  kl_loss, {
+      'flow_value_loss': value_loss,
+      'flow_kl_loss': kl_loss,
   }

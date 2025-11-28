@@ -20,17 +20,18 @@ See: https://arxiv.org/pdf/1707.06347.pdf
 from typing import Any, Tuple
 
 from brax.training import types
-from agents.ppo import networks as ppo_networks
+from agents.gmmppo import networks as gmmppo_networks
 from brax.training.types import Params
 import flax
 import jax
 import jax.numpy as jnp
+from learning.module import networks
+from learning.module.gmmvi.network import GMMTrainingState
 
 
 @flax.struct.dataclass
-class PPONetworkParams:
+class GMMPPONetworkParams:
   """Contains training state for the learner."""
-
   policy: Params
   value: Params
 
@@ -100,12 +101,12 @@ def compute_gae(
   return jax.lax.stop_gradient(vs), jax.lax.stop_gradient(advantages)
 
 
-def compute_ppo_loss(
-    params: PPONetworkParams,
+def compute_gmmppo_loss(
+    params: GMMPPONetworkParams,
     normalizer_params: Any,
     data: types.Transition,
     rng: jnp.ndarray,
-    ppo_network: ppo_networks.PPONetworks,
+    gmmppo_network: gmmppo_networks.GMMPPONetworks,
     entropy_cost: float = 1e-4,
     discounting: float = 0.9,
     reward_scaling: float = 1.0,
@@ -113,7 +114,7 @@ def compute_ppo_loss(
     clipping_epsilon: float = 0.3,
     normalize_advantage: bool = True,
 ) -> Tuple[jnp.ndarray, types.Metrics]:
-  """Computes PPO loss.
+  """Computes GMMPPO loss.
 
   Args:
     params: Network parameters,
@@ -122,7 +123,7 @@ def compute_ppo_loss(
       are ['state_extras']['truncation'] ['policy_extras']['raw_action']
       ['policy_extras']['log_prob']
     rng: Random key
-    ppo_network: PPO networks.
+    gmmppo_network: GMMPPO networks.
     entropy_cost: entropy cost.
     discounting: discounting,
     reward_scaling: reward multiplier.
@@ -133,9 +134,9 @@ def compute_ppo_loss(
   Returns:
     A tuple (loss, metrics)
   """
-  parametric_action_distribution = ppo_network.parametric_action_distribution
-  policy_apply = ppo_network.policy_network.apply
-  value_apply = ppo_network.value_network.apply
+  parametric_action_distribution = gmmppo_network.parametric_action_distribution
+  policy_apply = gmmppo_network.policy_network.apply
+  value_apply = gmmppo_network.value_network.apply
 
   # Put the time dimension first.
   data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
@@ -155,6 +156,7 @@ def compute_ppo_loss(
       policy_logits, data.extras['policy_extras']['raw_action']
   )
   behaviour_action_log_probs = data.extras['policy_extras']['log_prob']
+
   vs, advantages = compute_gae(
       truncation=truncation,
       termination=termination,
@@ -184,9 +186,44 @@ def compute_ppo_loss(
   entropy_loss = entropy_cost * -entropy
 
   total_loss = policy_loss + v_loss + entropy_loss
-  return total_loss, { # add surrogate loss function for target_pdf function in PPO
+  return total_loss, {
       'total_loss': total_loss,
       'policy_loss': policy_loss,
       'v_loss': v_loss,
       'entropy_loss': entropy_loss,
   }
+def make_gmm_update(gmm_network: networks.FeedForwardNetwork):
+  def gmm_update(
+          gmmvi_state, key
+    ):
+      samples, mapping, sample_dist_densities, target_lnpdfs, target_lnpdf_grads = \
+          gmm_network.sample_selector.select_train_datas(gmmvi_state.sample_db_state)
+      new_component_stepsizes = gmm_network.component_stepsize_fn(gmmvi_state.model_state)
+      new_model_state = gmm_network.model.update_stepsizes(gmmvi_state.model_state, new_component_stepsizes)
+      expected_hessian_neg, expected_grad_neg = gmm_network.more_ng_estimator(new_model_state,
+                                                              samples,
+                                                              sample_dist_densities,
+                                                              target_lnpdfs,
+                                                              target_lnpdf_grads)
+      new_model_state = gmm_network.component_updater(new_model_state,
+                                      expected_hessian_neg,
+                                      expected_grad_neg,
+                                      new_model_state.stepsizes)
+          
+      new_model_state = gmm_network.weight_updater(new_model_state, samples, sample_dist_densities, target_lnpdfs,
+                                                      gmmvi_state.weight_stepsize)
+      new_num_updates = gmmvi_state.num_updates + 1
+      # new_model_state, new_component_adapter_state, new_sample_db_state = \
+          # gmm_network.component_adapter(gmmvi_state.component_adaptation_state,
+          #                                             gmmvi_state.sample_db_state,
+          #                                             new_model_state,
+          #                                             new_num_updates,
+                                                      # key)
+
+      return GMMTrainingState(temperature=gmmvi_state.temperature,
+                          model_state=new_model_state,
+                          component_adaptation_state=gmmvi_state.component_adaptation_state,#new_component_adapter_state,
+                          num_updates=new_num_updates,
+                          sample_db_state=gmmvi_state.sample_db_state,#new_sample_db_state,
+                          weight_stepsize=gmmvi_state.weight_stepsize)
+  return gmm_update

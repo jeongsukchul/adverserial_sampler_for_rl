@@ -15,7 +15,7 @@ class Funnel(Target):
     def __init__(self, dim, log_Z=0., can_sample=True, sample_bounds=None) -> None:
         super().__init__(dim, log_Z, can_sample)
         self.data_ndim = dim
-        self.dist_dominant = distrax.Normal(jnp.array([0.0]), jnp.array([3.0]))
+        self.dist_dominant = distrax.Normal(jnp.array([0.0]), jnp.array([3.]))
         self.mean_other = jnp.zeros(dim - 1, dtype=float)
         self.cov_eye = jnp.eye(dim - 1).reshape((1, dim - 1, dim - 1))
         self.sample_bounds = sample_bounds
@@ -39,7 +39,7 @@ class Funnel(Target):
         if not batched:
             log_prob = jnp.squeeze(log_prob, axis=0)
         max_log_prob = jnp.max(log_prob)
-        log_prob = -10 *jnp.ones_like(log_prob)
+        # log_prob = -10 *jnp.ones_like(log_prob)
         log_prob = jnp.where(jnp.logical_or(x[:,0] > high[0], x[:,0] < low[0]) , max_log_prob* jnp.ones_like(log_prob), log_prob).squeeze()
         log_prob = jnp.where(jnp.logical_or(x[:,1] > high[1], x[:,1] < low[1]) , max_log_prob* jnp.ones_like(log_prob), log_prob).squeeze()
         

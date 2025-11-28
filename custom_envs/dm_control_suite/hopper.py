@@ -405,9 +405,6 @@ def domain_randomize_eval(model: mjx.Model, dr_range, params=None, rng:jax.Array
 
     (geom_friction, body_ipos, body_mass, dof_frictionloss) = shift_dynamics(params)
   elif rng is not None and params is None:
-    # params = jax.random.uniform(key=jax.random.PRNGKey(0), shape=(rng.shape[0], len(dr_low)), minval=dr_low, maxval=dr_high)
-    # rng = jax.random.split(jax.random.PRNGKey(0), rng.shape[0])
-    # print("params", params)
     (
       geom_friction,
       body_ipos,

@@ -362,7 +362,7 @@ class AdvEvaluator:
     def generate_eval_unroll(
         policy_params: PolicyParams, eval_dynamics_params, key: PRNGKey
     ) -> State:
-      reset_keys = jax.random.split(key, num_eval_envs)
+      reset_keys = jax.random.split(key, len(eval_dynamics_params))
       eval_first_state = eval_env.reset(reset_keys)
       return generate_adv_unroll(
           eval_env,
@@ -384,24 +384,40 @@ class AdvEvaluator:
       dynamics_params : jnp.ndarray,
       training_metrics: Metrics,
       aggregate_episodes: bool = True,
+      num_eval_seeds: int = 1,
   ) -> Metrics:
     """Run one epoch of evaluation."""
     self._key, unroll_key = jax.random.split(self._key)
+    unroll_keys = jax.random.split(unroll_key, num_eval_seeds)
     t = time.time()
-    eval_state = self._generate_eval_unroll(policy_params, dynamics_params, unroll_key)
-    eval_metrics = eval_state.info['eval_metrics']
+    def f(carry, key):
+      eval_state = self._generate_eval_unroll(policy_params, dynamics_params, key)
+      eval_metrics = eval_state.info['eval_metrics']
+      return carry, eval_metrics
+    _, eval_metrics = jax.lax.scan(f, None, unroll_keys)
+    # eval_state = self._generate_eval_unroll(policy_params, dynamics_params, unroll_key)
+    # eval_metrics = eval_state.info['eval_metrics']
+    eval_metrics = jax.tree_util.tree_map(lambda x : x.mean(axis=0), eval_metrics)
+    reward_2d = eval_metrics.episode_metrics['reward']
     eval_metrics.active_episodes.block_until_ready()
     epoch_eval_time = time.time() - t
     metrics = {}
     iqm_fn = functools.partial(scipy.stats.trim_mean, proportiontocut=0.25, axis=None) 
-    for fn in [np.mean, np.std, iqm_fn]:
-      suffix = '_std' if fn == np.std else '_iqm' if fn == iqm_fn else ''
-      metrics.update({
-          f'eval/episode_{name}{suffix}': (
-              fn(value) if aggregate_episodes else value
-          )
-          for name, value in eval_metrics.episode_metrics.items()
-      })
+    # for fn in [np.mean, np.std, iqm_fn]:
+    #   suffix = '_std' if fn == np.std else '_iqm' if fn == iqm_fn else ''
+    #   metrics.update({
+    #       f'eval/episode_{name}{suffix}': (
+    #           fn(value) if aggregate_episodes else value
+    #       )
+    #       for name, value in eval_metrics.episode_metrics.items()
+    #   })
+    metrics['eval/episode_reward_mean'] = np.mean(eval_metrics.episode_metrics['reward'])
+    metrics['eval/episode_reward_p25'] = np.percentile(eval_metrics.episode_metrics['reward'],25)
+    metrics['eval/episode_reward_p75'] = np.percentile(eval_metrics.episode_metrics['reward'],75)
+    metrics['eval/episode_reward_std'] = np.std(eval_metrics.episode_metrics['reward'])
+    metrics['eval/episode_reward_min'] = np.min(eval_metrics.episode_metrics['reward'])
+    metrics['eval/episode_reward_max'] = np.max(eval_metrics.episode_metrics['reward'])
+    metrics['eval/episode_reward_iqm'] = scipy.stats.trim_mean(eval_metrics.episode_metrics['reward'], proportiontocut=0.25, axis=None)
     metrics['eval/avg_episode_length'] = np.mean(eval_metrics.episode_steps)
     metrics['eval/std_episode_length'] = np.std(eval_metrics.episode_steps)
     metrics['eval/epoch_eval_time'] = epoch_eval_time
@@ -413,4 +429,4 @@ class AdvEvaluator:
         **metrics,
     }
 
-    return metrics  # pytype: disable=bad-return-type  # jax-ndarray
+    return metrics, reward_2d   # pytype: disable=bad-return-type  # jax-ndarray

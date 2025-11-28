@@ -37,7 +37,7 @@ def brax_ppo_config(env_name: str) -> config_dict.ConfigDict:
       discounting=0.995,
       learning_rate=1e-3,
       entropy_cost=1e-2,
-      num_envs=2048,
+      num_envs=1024,
       batch_size=1024,
   )
 
@@ -59,6 +59,7 @@ def brax_ppo_config(env_name: str) -> config_dict.ConfigDict:
         policy_obs_key="state",
         value_obs_key="privileged_state",
     )
+    rl_config.num_timesteps=200_000_000
   return rl_config
 
 

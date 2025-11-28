@@ -31,6 +31,11 @@ def setup_fixed_sample_selector(sample_db: SampleDB, gmm_wrapper: GMMWrapper,
             maxval=gmm_wrapper_state.gmm_state.num_components,   # can be a tracer
             dtype=jnp.int32,
         )
+        # mapping = jax.random.categorical(
+        #     mapping_seed,
+        #     gmm_wrapper_state.gmm_state.component_mask, gmm_wrapper_state.gmm_state.log_weights,
+        #     shape=(SIMUL_SAMPLES,),
+        # )
         mapping = jnp.sort(mapping)
         new_samples, _ = gmm_wrapper.sample_from_components_shuffle(gmm_wrapper_state.gmm_state,
                                                                              mapping,

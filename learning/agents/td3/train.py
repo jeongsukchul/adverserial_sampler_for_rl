@@ -224,24 +224,12 @@ def train(
   else:
     training_dr_range = None
   training_randomization_fn = None
-  if randomization_fn is not None:
-    if custom_wrapper:
-      training_randomization_fn = functools.partial(
-          randomization_fn,
-          # rng=jax.random.split(
-          #     key, num_envs // jax.process_count() // local_devices_to_use
-          # ),
-          dr_range=training_dr_range,
-      )
-    else:
-      training_randomization_fn = functools.partial(
-          randomization_fn,
-          rng=jax.random.split(
-              key, num_envs // jax.process_count() // local_devices_to_use
-          ),
-          dr_range=training_dr_range,
-      )
+
   if custom_wrapper and randomization_fn is not None:
+    training_randomization_fn = functools.partial(
+          randomization_fn,
+          dr_range=training_dr_range,
+      )
     if adv_wrapper:
         env = wrap_for_adv_training(
         env,
@@ -263,11 +251,17 @@ def train(
       )  # pytype: disable=wrong-keyword-args
 
   else:
+    v_randomization_fn = functools.partial(
+        eval_randomization_fn,
+          rng=jax.random.split(
+              key, num_envs // jax.process_count() // local_devices_to_use),\
+                  dr_range=training_dr_range
+    ) if eval_randomization_fn is not None else None
     env = wrap_for_brax_training(
       env,
         episode_length=episode_length,
         action_repeat=action_repeat,
-        randomization_fn=training_randomization_fn,
+        randomization_fn=v_randomization_fn,
     )
 
   obs_shape = env.observation_size
@@ -410,12 +404,15 @@ def train(
       if adv_wrapper:
         # params = env_state.info["dr_params"] * (1 - env_state.done[..., None]) + dynamics_params * env_state.done[..., None]
         nstate = env.step(env_state, actions, dynamics_params)
+        state_size = nstate.obs['state'].shape[-1]
+        previleged_obs_info = nstate.obs['privileged_state'][:, state_size:] 
+        env_state.obs['privileged_state'] = env_state.obs['privileged_state'].at[:, 17:].set(previleged_obs_info)
       else:
         nstate = env.step(env_state, actions, step_key)
     else:
       nstate = env.step(env_state, actions)
     q_values = td3_network.q_network.apply(normalizer_params, q_params, env_state.obs, actions).mean(-1)
-    target_lnpdfs = jax.nn.log_softmax(q_values, -1)
+    target_lnpdfs = jax.nn.log_softmax(-q_values, -1)
     state_extras = {x: nstate.info[x] for x in extra_fields}
     return nstate, TransitionwithCritic(  # pytype: disable=wrong-arg-types  # jax-ndarray
         observation=env_state.obs,
@@ -661,11 +658,7 @@ def train(
   env_keys = jnp.reshape(
       env_keys, (local_devices_to_use, -1) + env_keys.shape[1:]
   )
-  if randomization_fn is not None and custom_wrapper :
-
-    env_state = jax.pmap(env.reset)(env_keys)#, dynamics_params
-  else:
-    env_state = jax.pmap(env.reset)(env_keys)
+  env_state = jax.pmap(env.reset)(env_keys)
   print("obs", jax.tree_util.tree_map( lambda x: x.shape , env_state.obs))
   obs_shape = jax.tree_util.tree_map(
       lambda x: specs.Array(x.shape[-1:], jnp.dtype('float32')), env_state.obs
@@ -778,7 +771,7 @@ def train(
     logging.info('step %s', current_step)
 
     # Optimization
-    epoch_key, local_key = jax.random.split(local_key)
+    epoch_key, evaluation_key, local_key = jax.random.split(local_key, 3)
     epoch_keys = jax.random.split(epoch_key, local_devices_to_use)
     (training_state, env_state, buffer_state, training_metrics) = (
         training_epoch_with_timing(
@@ -811,17 +804,15 @@ def train(
       logging.info(metrics)
       progress_fn(current_step, metrics)
       #evaluation on current occupancy
-  evaluation_key, local_key = jax.random.split(local_key)
-  evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
-  if adv_wrapper:
-    target_pdfs = evaluation_on_current_occupancy(
-        training_state, env_state, buffer_state, evaluation_key
-    )
-    x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
-                          jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
-    target_pdfs = target_pdfs.mean(axis=(0,2))
-    target_pdfs = jnp.reshape(target_pdfs, x.shape)
-    if process_id==0:
+    evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
+    if adv_wrapper:
+      target_pdfs = evaluation_on_current_occupancy(
+          training_state, env_state, buffer_state, evaluation_key
+      )
+      x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
+                            jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
+      target_pdfs = target_pdfs.mean(axis=(0,2))
+      target_pdfs = jnp.reshape(target_pdfs, x.shape)
       target_fig = plt.figure()
       ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
       cbar = target_fig.colorbar(ctf)

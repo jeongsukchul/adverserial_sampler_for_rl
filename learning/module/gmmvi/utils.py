@@ -41,7 +41,7 @@ def reduce_weighted_logsumexp(logx, w=None, axis=None, keep_dims=False, return_s
       return lswe, sgn
     return lswe
 
-def visualise(log_prob_fn, dr_range_low:chex.Array, dr_range_high : chex.Array, samples: chex.Array = None, bijector_log_prob=None, show=False) -> dict:
+def visualise(log_prob_fn, dr_range_low:chex.Array, dr_range_high : chex.Array, samples: chex.Array = None, eval_samples = None, bijector_log_prob=None, show=False) -> dict:
     plt.close()
     fig = plt.figure()
     ax = fig.add_subplot()
@@ -59,6 +59,15 @@ def visualise(log_prob_fn, dr_range_low:chex.Array, dr_range_high : chex.Array, 
       # sample_x = jnp.clip(samples[idx, 0],low[0], high[0])
       # sample_y = jnp.clip(samples[idx, 1],low[1], high[1])
       ax.scatter(sample_x, sample_y, c='r', alpha=0.5, marker='x')
+      ax.xaxis.set_major_locator(MaxNLocator(nbins=10, prune=None))
+      ax.yaxis.set_major_locator(MaxNLocator(nbins=10, prune=None))
+    if eval_samples is not None:
+      idx = jax.random.choice(jax.random.PRNGKey(0), eval_samples.shape[0], (300,))
+      sample_x = eval_samples[idx,0]
+      sample_y = eval_samples[idx,1]
+      # sample_x = jnp.clip(samples[idx, 0],low[0], high[0])
+      # sample_y = jnp.clip(samples[idx, 1],low[1], high[1])
+      ax.scatter(sample_x, sample_y, c='b', alpha=0.5, marker='x')
       ax.xaxis.set_major_locator(MaxNLocator(nbins=10, prune=None))
       ax.yaxis.set_major_locator(MaxNLocator(nbins=10, prune=None))
     fig2 = None

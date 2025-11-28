@@ -383,14 +383,13 @@ def setup_log_densities_also_individual_fn(component_log_densities_fn: Callable,
 
 def setup_full_cov_gmm(DIM, MAX_COMPONENTS, bound_info=None) -> GMM:
     if bound_info is not None:
+        eps = 1e-6
         low, high = bound_info
         bijector = lambda x:  jnp.tanh(x)*(high-low)/2 + (low+high)/2
-        # bijector = lambda x: x
-        inv_bijector = lambda x: jnp.arctan((2*x-(low+high))/(high-low))
-        # inv_bijector = lambda x: x
-        bijector_log_prob = lambda x : jnp.log(2 * jnp.ones_like(low)).sum(-1) -jnp.log(high-low).sum(-1)-jnp.log(1- ((2*x-(low+high))/(high-low))**2).sum(-1)
-        # bijector_log_prob = lambda x : -jnp.log(1- ((2*x-(low+high))/(high-low))**2).sum(-1)
-        # bijector_log_prob = lambda x : 0
+        inv_bijector = lambda x: 0.5* (jnp.log1p(jnp.clip((2*x-(low+high))/(high-low), -1. + eps , 1.-eps))- jnp.log1p(-jnp.clip((2*x-(low+high))/(high-low), -1. + eps , 1.-eps)))
+        # bijector_log_prob = lambda x : jnp.log(2 * jnp.ones_like(low)).sum(-1) -jnp.log(high-low).sum(-1)-jnp.log(1- ((2*x-(low+high))/(high-low))**2).sum(-1)
+        bijector_log_prob = lambda x : jnp.sum(jnp.log(2.0) - jnp.log(high - low)) \
+            -jnp.log1p(-jnp.clip((2*x-(low+high))/(high-low), -1.+eps, 1.-eps)**2).sum(-1)
     else:
         bijector = lambda x: x
         inv_bijector = lambda x: x

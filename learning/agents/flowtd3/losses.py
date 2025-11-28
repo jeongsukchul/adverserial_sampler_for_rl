@@ -42,7 +42,7 @@ def make_losses(
     dynamics_param_size: int,
     fab_online: bool = False,
     alpha:int = 2,
-    use_advantage: bool = True,
+    use_advantage: bool = False,
     use_normalization: bool = True,
 ):
   """Creates the td3 losses."""
@@ -104,24 +104,6 @@ def make_losses(
     min_q = jnp.min(q_action, axis=-1)
     return -jnp.mean(min_q)
 
-  def fab_loss(
-    flow_params: Params,
-    normalizer_params: Any,
-    policy_params: Params,
-    current_q_params: Params,
-    dynamics_params: jnp.ndarray,
-    transitions: Any,
-    dr_range_high,
-    dr_range_low,
-    lmbda_params:Params,
-    key: jax.random.PRNGKey,
-  ):
-    def log_p_fn(x):
-       return q_network.apply(normalizer_params, current_q_params, transitions.next_observation, \
-                              policy_network.apply(normalizer_params, policy_params, transitions.next_observation))
-    def log_q_fn(x):
-       return flow_network.apply(flow_params, mode='log_prob', low=dr_range_low, high=dr_range_high, x=x)
-    point, log_w, smc_state, smc_info = smc.step(x0, smc_state, log_q_fn, )
 
   def flow_loss(
       flow_params: Params,
@@ -167,17 +149,18 @@ def make_losses(
         normalizer_params, policy_params, transitions.next_observation
     )
     # Get Q-value for adversarial next state-action pair
-    next_q_adv = q_network.apply(normalizer_params, current_q_params, transitions.next_observation, next_action).min(-1)
-    current_q = q_network.apply(normalizer_params, current_q_params, transitions.observation, transitions.action).min(-1)
-    truncation = transitions.extras['state_extras']['truncation']
-    advantage = transitions.reward + transitions.discount* next_q_adv - current_q
-    if use_normalization:
-        advantage = (jax.lax.stop_gradient(1/advantage.mean())) * advantage
-    advantage *= 1-truncation
-    if use_advantage:
-        value_loss = (data_log_prob * advantage).mean()
-    else: 
-        value_loss = (data_log_prob * next_q_adv).mean()
+    # next_q_adv = q_network.apply(normalizer_params, current_q_params, transitions.next_observation, next_action).min(-1)
+    # current_q = q_network.apply(normalizer_params, current_q_params, transitions.observation, transitions.action).min(-1)
+    # truncation = transitions.extras['state_extras']['truncation']
+    # advantage = transitions.reward + transitions.discount* next_q_adv - current_q
+    # if use_normalization:
+    #     advantage = (jax.lax.stop_gradient(1/advantage.mean())) * advantage
+    # advantage *= 1-truncation
+    # if use_advantage:
+    #     value_loss = (data_log_prob * advantage).mean()
+    # else: 
+    #     value_loss = (data_log_prob * next_q_adv).mean()
+    value_loss = transitions.target_lnpdf.mean()
     # return lmbda_params* value_loss + kl_loss, (env_state, buffer_state, normalizer_params, noise_scales, simul_info, value_loss, kl_loss)
     return -lmbda_params * value_loss +  kl_loss, (value_loss, kl_loss)
   return critic_loss, actor_loss, flow_loss

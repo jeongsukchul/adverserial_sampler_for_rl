@@ -69,7 +69,7 @@ delta : ???
 lambda_update_steps : ???
 single_lambda : false
 lmbda_lr : ???
-init_lmbda : ???
+init_lmbda : 1.
 distance_type : wass
 custom_wrapper: true
 adv_wrapper : true

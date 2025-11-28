@@ -517,19 +517,19 @@ def train(
     (training_state, _), metrics = jax.lax.scan(
         sgd_step, (training_state, training_key), transitions
     )
-    if not no_gmm_training:
-      new_gmm_training_state = gmm_update(training_state.gmm_training_state, key_gmm)
-      training_state = training_state.replace(gmm_training_state=new_gmm_training_state)
-      gmm_metrics={
-          'num_components' : new_gmm_training_state.model_state.gmm_state.num_components,
-          'gmm_mean_x_min' : new_gmm_training_state.model_state.gmm_state.means[:,0].min(),
-          'gmm_mean_x_mean' : new_gmm_training_state.model_state.gmm_state.means[:,0].mean(),
-          'gmm_mean_x_max' : new_gmm_training_state.model_state.gmm_state.means[:,0].max(),
-          'gmm_mean_y_min' : new_gmm_training_state.model_state.gmm_state.means[:,1].min(),
-          'gmm_mean_y_mean' : new_gmm_training_state.model_state.gmm_state.means[:,1].mean(),
-          'gmm_mean_y_max' : new_gmm_training_state.model_state.gmm_state.means[:,1].max(),
-      }
-      metrics.update(gmm_metrics)
+    new_gmm_training_state = jax.lax.cond(no_gmm_training, lambda : gmm_update(training_state.gmm_training_state, key_gmm), lambda: training_state.gmm_training_state)
+    new_gmm_training_state = gmm_update(training_state.gmm_training_state, key_gmm)
+    training_state = training_state.replace(gmm_training_state=new_gmm_training_state)
+    gmm_metrics={
+        'num_components' : new_gmm_training_state.model_state.gmm_state.num_components,
+        'gmm_mean_x_min' : new_gmm_training_state.model_state.gmm_state.means[:,0].min(),
+        'gmm_mean_x_mean' : new_gmm_training_state.model_state.gmm_state.means[:,0].mean(),
+        'gmm_mean_x_max' : new_gmm_training_state.model_state.gmm_state.means[:,0].max(),
+        'gmm_mean_y_min' : new_gmm_training_state.model_state.gmm_state.means[:,1].min(),
+        'gmm_mean_y_mean' : new_gmm_training_state.model_state.gmm_state.means[:,1].mean(),
+        'gmm_mean_y_max' : new_gmm_training_state.model_state.gmm_state.means[:,1].max(),
+    }
+    metrics.update(gmm_metrics)
     metrics['buffer_current_size'] = replay_buffer.size(buffer_state)
     metrics.update(simul_info)
     return training_state, env_state, buffer_state, metrics, dynamics_params, target_lnpdf
@@ -624,26 +624,27 @@ def train(
       env_state: envs.State,
       buffer_state: ReplayBufferState,
       key: PRNGKey,
-      no_gmm_training: bool = False,
+      # no_gmm_training: bool = False,
       train_length: int = 1,
   ) -> Tuple[TrainingState, envs.State, ReplayBufferState, Metrics]:
 
     def f(carry, unused_t):
-      ts, es, bs, k = carry
+      ts, es, bs, k, idx = carry
       k, new_key = jax.random.split(k)
+      no_gmm_training = (idx % 100 != 0)
       ts, es, bs, metrics, dps, lnpdfs = training_step(ts, es, bs, k, no_gmm_training)
-      return (ts, es, bs, new_key), (metrics, dps, lnpdfs)
+      return (ts, es, bs, new_key, idx+1), (metrics, dps, lnpdfs)
 
-    (training_state, env_state, buffer_state, key), (metrics, dynamics_params, target_lnpdfs) = jax.lax.scan(
+    (training_state, env_state, buffer_state, key, _), (metrics, dynamics_params, target_lnpdfs) = jax.lax.scan(
         f,
-        (training_state, env_state, buffer_state, key),
+        (training_state, env_state, buffer_state, key, 0),
         (),
         length=train_length,
     )
     metrics = jax.tree_util.tree_map(jnp.mean, metrics)
     return training_state, env_state, buffer_state, metrics, dynamics_params, target_lnpdfs
 
-  training_epoch_pmap = jax.pmap(functools.partial(training_epoch, no_gmm_training=False, train_length=num_training_steps_per_epoch),\
+  training_epoch_pmap = jax.pmap(functools.partial(training_epoch, train_length=num_training_steps_per_epoch),\
                                   axis_name=_PMAP_AXIS_NAME)
 
   # Note that this is NOT a pure jittable method.
@@ -785,10 +786,12 @@ def train(
   print("setup time", ed-st)
   # # Create and initialize the replay buffer.
   sample_key, local_key = jax.random.split(local_key)
-  samples = gmmtd3_network.gmm_network.model.sample(_unpmap(training_state.gmm_training_state.model_state.gmm_state), sample_key, 1000)[0]
-  log_prob_fn = jax.vmap(functools.partial(gmmtd3_network.gmm_network.model.log_density,\
-                                            gmm_state=_unpmap(training_state.gmm_training_state.model_state.gmm_state)))
+  t = time.time()
+  
   if process_id ==0:
+    samples = gmmtd3_network.gmm_network.model.sample(_unpmap(training_state.gmm_training_state.model_state.gmm_state), sample_key, 1000)[0]
+    log_prob_fn = jax.vmap(functools.partial(gmmtd3_network.gmm_network.model.log_density,\
+                                            gmm_state=_unpmap(training_state.gmm_training_state.model_state.gmm_state)))
     model_fig, model_fig_raw = gmm_utils.visualise(
       log_prob_fn,
       dr_range_low,
@@ -817,7 +820,6 @@ def train(
     progress_fn(0, metrics)
 
     print("fig initial step")
-  t = time.time()
   prefill_key, local_key = jax.random.split(local_key)
   prefill_keys = jax.random.split(prefill_key, local_devices_to_use)
   training_state, env_state, buffer_state, _ = prefill_replay_buffer(
@@ -840,6 +842,7 @@ def train(
                         jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
   target_pdfs = target_pdfs.mean(axis=(0,2))
   target_pdfs = jnp.reshape(target_pdfs, x.shape)
+  target_entropy = target_pdfs.mean()
   print("x shape", x.shape)
   if process_id==0:
     target_fig = plt.figure()
@@ -925,7 +928,6 @@ def train(
           training_metrics,
       )
       logging.info(metrics)
-      progress_fn(current_step, metrics)
       #evaluation on current occupancy
       evaluation_key, local_key = jax.random.split(local_key)
       evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
@@ -936,6 +938,7 @@ def train(
                             jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
       target_pdfs = target_pdfs.mean(axis=(0,2))
       target_pdfs = target_pdfs.reshape(x.shape)
+      target_entropy = target_pdfs.mean()
       if process_id==0:
         target_fig = plt.figure()
         ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
@@ -944,6 +947,9 @@ def train(
           wandb.log({
             'target_prob on current occupancy with critic' : wandb.Image(target_fig)
           }, step=current_step)
+      metrics.update({'target entropy' : target_entropy})
+      progress_fn(current_step, metrics)
+      
   total_steps = current_step
   if not total_steps >= num_timesteps:
     raise AssertionError(

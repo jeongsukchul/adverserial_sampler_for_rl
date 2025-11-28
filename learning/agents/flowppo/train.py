@@ -31,16 +31,17 @@ from brax.training import pmap
 from brax.training import types
 from brax.training.acme import running_statistics
 from brax.training.acme import specs
-from agents.ppo import checkpoint
-from agents.ppo import losses as ppo_losses
-from agents.ppo import networks as ppo_networks
+from agents.flowppo import checkpoint
+from agents.flowppo import losses as flowppo_losses
+from agents.flowppo import networks as flowppo_networks
 from brax.training.types import Params
 from brax.training.types import PRNGKey
 import flax
 import jax
 import jax.numpy as jnp
+from learning.module.normalizing_flow.simple_flow import render_flow_pdf_1d_subplots, render_flow_pdf_2d_subplots
+from learning.module.target_examples.funnel import Funnel
 from learning.module.wrapper.adv_wrapper import wrap_for_adv_training
-from learning.module.wrapper.dr_wrapper import wrap_for_dr_training
 import numpy as np
 import optax
 import wandb
@@ -58,7 +59,7 @@ class TrainingState:
   """Contains training state for the learner."""
 
   optimizer_state: optax.OptState
-  params: ppo_losses.PPONetworkParams
+  params: flowppo_losses.FLOWPPONetworkParams
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: types.UInt64
 
@@ -87,7 +88,7 @@ def _validate_madrona_args(
   """Validates arguments for Madrona-MJX."""
   if madrona_backend:
     if eval_env:
-      raise ValueError("Madrona-MJX doesn't support multiple env instances")
+      raise ValueError("Madrona-MJX doesn't suflowpport multiple env instances")
     if num_eval_envs != num_envs:
       raise ValueError('Madrona-MJX requires a fixed batch size')
     if action_repeat != 1:
@@ -187,8 +188,8 @@ def train(
     max_grad_norm: Optional[float] = None,
     normalize_advantage: bool = True,
     network_factory: types.NetworkFactory[
-        ppo_networks.PPONetworks
-    ] = ppo_networks.make_ppo_networks,
+        flowppo_networks.FLOWPPONetworks
+    ] = flowppo_networks.make_flowppo_networks,
     seed: int = 0,
     # eval
     num_evals: int = 1,
@@ -207,11 +208,12 @@ def train(
     restore_params: Optional[Any] = None,
     restore_value_fn: bool = True,
     run_evals: bool = True,
-    adv_wrapper = False,
+    lmbda_params = .1,
     dr_train_ratio = 1.0,
-    use_wandb= False,
+    use_wandb = False,
+    adv_wrapper = False, # unused but need for code
 ):
-  """PPO training.
+  """FLOWPPO training.
 
   Args:
     environment: the environment to train
@@ -235,12 +237,12 @@ def train(
       wrapper.
     randomization_fn: a user-defined callback function that generates randomized
       environments
-    learning_rate: learning rate for ppo loss
-    entropy_cost: entropy reward for ppo loss, higher values increase entropy of
+    learning_rate: learning rate for flowppo loss
+    entropy_cost: entropy reward for flowppo loss, higher values increase entropy of
       the policy
     discounting: discounting rate
     unroll_length: the number of timesteps to unroll in each environment. The
-      PPO loss is computed over `unroll_length` timesteps
+      FLOWPPO loss is computed over `unroll_length` timesteps
     batch_size: the batch size for each minibatch SGD step
     num_minibatches: the number of times to run the SGD step, each with a
       different minibatch with leading dimension of `batch_size`
@@ -250,7 +252,7 @@ def train(
       eval. The environment resets occur on the host
     normalize_observations: whether to normalize observations
     reward_scaling: float scaling for reward
-    clipping_epsilon: clipping epsilon for PPO loss
+    clipping_epsilon: clipping epsilon for FLOWPPO loss
     gae_lambda: General advantage estimation lambda
     max_grad_norm: gradient clipping norm value. If None, no clipping is done
     normalize_advantage: whether to normalize advantage estimate
@@ -275,7 +277,7 @@ def train(
     restore_checkpoint_path: the path used to restore previous model params
     restore_params: raw network parameters to restore the TrainingState from.
       These override `restore_checkpoint_path`. These paramaters can be obtained
-      from the return values of ppo.train().
+      from the return values of flowppo.train().
     restore_value_fn: whether to restore the value function from the checkpoint
       or use a random initialization
     run_evals: if True, use the evaluator num_eval times to collect distinct
@@ -333,7 +335,7 @@ def train(
   local_key, key_env, eval_key = jax.random.split(local_key, 3)
   # key_networks should be global, so that networks are initialized the same
   # way for different processes.
-  key_policy, key_wrap, key_value = jax.random.split(global_key, 3)
+  key_policy, key_wrap, key_value, key_flow = jax.random.split(global_key, 4)
   del global_key
 
   assert num_envs % device_count == 0
@@ -349,44 +351,20 @@ def train(
     training_dr_range = None
   training_randomization_fn = None
 
-  if adv_wrapper and randomization_fn is not None:
-    training_randomization_fn = functools.partial(
-          randomization_fn,
-          dr_range=training_dr_range,
-      )
-    if adv_wrapper:
-        env = wrap_for_adv_training(
-          env,
-          episode_length=episode_length,
-          action_repeat=action_repeat,
-          randomization_fn=training_randomization_fn,
-          param_size = len(dr_range_low),
-          dr_range_low=dr_range_low,
-          dr_range_high=dr_range_high,
-        )
-    else:
-      env = wrap_for_dr_training(#wrap_for_training(
-          env,
-          episode_length=episode_length,
-          action_repeat=action_repeat,
-          randomization_fn=training_randomization_fn,
-          n_nominals=1,
-          n_envs=num_envs,
-      )  # pytype: disable=wrong-keyword-args
-
-  else:
-    v_randomization_fn = functools.partial(
-        eval_randomization_fn,
-          rng=jax.random.split(
-              key_wrap, num_envs // jax.process_count() // local_devices_to_use),\
-                  dr_range=training_dr_range
-    ) if eval_randomization_fn is not None else None
-    env = wrap_for_brax_training(
-      env,
-        episode_length=episode_length,
-        action_repeat=action_repeat,
-        randomization_fn=v_randomization_fn,
+  training_randomization_fn = functools.partial(
+        randomization_fn,
+        dr_range=training_dr_range,
     )
+  env = wrap_for_adv_training(
+    env,
+    episode_length=episode_length,
+    action_repeat=action_repeat,
+    randomization_fn=training_randomization_fn,
+    param_size = len(dr_range_low),
+    dr_range_low=dr_range_low,
+    dr_range_high=dr_range_high,
+  )
+
   key_envs = jax.random.split(key_env, num_envs // process_count)
   key_envs = jnp.reshape(
       key_envs, (local_devices_to_use, -1) + key_envs.shape[1:]
@@ -394,16 +372,20 @@ def train(
   env_state= jax.pmap(env.reset)(key_envs)
   # Discard the batch axes over devices and envs.
   obs_shape = jax.tree_util.tree_map(lambda x: x.shape[2:], env_state.obs)
-  print("PPO OBS SIZE", obs_shape)
-  normalize = lambda x, y: x
+  print("FLOWPPO OBS SIZE", obs_shape)
+  normalize_fn = lambda x, y: x
   if normalize_observations:
-    normalize = running_statistics.normalize
-  ppo_network = network_factory(
-      obs_shape, env.action_size, preprocess_observations_fn=normalize
+    normalize_fn = running_statistics.normalize
+  flowppo_network = network_factory(
+    observation_size = obs_shape,
+    action_size= env.action_size, 
+    dynamics_param_size=len(dr_range_low), 
+    preprocess_observations_fn=normalize_fn,
   )
-  make_policy = ppo_networks.make_inference_fn(ppo_network)
+  make_policy = flowppo_networks.make_inference_fn(flowppo_network)
 
   optimizer = optax.adam(learning_rate=learning_rate)
+  flow_optimizer = optax.adam(learning_rate=learning_rate)
   if max_grad_norm is not None:
     # TODO: Move gradient clipping to `training/gradients.py`.
     optimizer = optax.chain(
@@ -412,8 +394,8 @@ def train(
     )
 
   loss_fn = functools.partial(
-      ppo_losses.compute_ppo_loss,
-      ppo_network=ppo_network,
+      flowppo_losses.compute_flowppo_loss,
+      flowppo_network=flowppo_network,
       entropy_cost=entropy_cost,
       discounting=discounting,
       reward_scaling=reward_scaling,
@@ -421,15 +403,24 @@ def train(
       clipping_epsilon=clipping_epsilon,
       normalize_advantage=normalize_advantage,
   )
+  flowloss_fn = functools.partial(
+    flowppo_losses.flow_loss,
+    flowppo_network=flowppo_network,
+    dr_range_high=dr_range_high,
+    dr_range_low=dr_range_low,
+    lmbda_params=lmbda_params,
+  )
   gae_fn = functools.partial(
-      ppo_losses.compute_gae,
+      flowppo_losses.compute_gae,
       lambda_=gae_lambda,
       discount=discounting,
   )
   gradient_update_fn = gradients.gradient_update_fn(
       loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
-
+  flow_update_fn = gradients.gradient_update_fn(
+    flowloss_fn, flow_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+  )
   metrics_aggregator = metric_logger.EpisodeMetricsLogger(
       steps_between_logging=training_metrics_steps
       or env_step_per_training_step,
@@ -500,36 +491,19 @@ def train(
         training_state.params.policy,
         training_state.params.value,
     ))
-    if adv_wrapper:
-      print("dynamics params", dynamics_params)
-      # dynamics_params = env_state.info["dr_params"] * (1 - env_state.done[..., None]) + dynamics_params[None, ...] * env_state.done[..., None]
-      def f(carry, unused_t):
-        current_state, current_key = carry
-        current_key, next_key = jax.random.split(current_key)
-        next_state, data = generate_adv_unroll(
-            env,
-            current_state,
-            dynamics_params.squeeze(),
-            policy,
-            current_key,
-            unroll_length,
-            extra_fields=('truncation', 'episode_metrics', 'episode_done'),
-        )
-        return (next_state, next_key), data
-    else:
-      def f(carry, unused_t):
-        current_state, current_key = carry
-        current_key, next_key = jax.random.split(current_key)
-        next_state, data = acting.generate_unroll(
-            env,
-            current_state,
-            policy,
-            current_key,
-            unroll_length,
-            extra_fields=('truncation', 'episode_metrics', 'episode_done'),
-        )
-        return (next_state, next_key), data
-
+    def f(carry, unused_t):
+      current_state, current_key = carry
+      current_key, next_key = jax.random.split(current_key)
+      next_state, data = generate_adv_unroll(
+          env,
+          current_state,
+          dynamics_params,
+          policy,
+          current_key,
+          unroll_length,
+          extra_fields=('truncation', 'episode_metrics', 'episode_done'),
+      )
+      return (next_state, next_key), data
     (state, _), data = jax.lax.scan(
         f,
         (state, key_generate_unroll),
@@ -540,22 +514,28 @@ def train(
   def training_step(
       carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
   ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
-    training_state, state, key = carry
-    key_sgd, key_generate_unroll, param_key,  new_key = jax.random.split(key, 4)
-    dynamics_params = jax.random.uniform(key=param_key, shape=(num_envs//jax.process_count(),len(dr_range_low)), minval=dr_range_low, maxval=dr_range_high)
-    # dynamics_params = (dr_range_low + dr_range_high)/2 +\
-    #   jax.random.normal(key=param_key, shape=(num_envs//jax.process_count(),len(dr_range_low)))\
-    #     * (dr_range_high - dr_range_low)/100
-    # dynamics_params = jnp.clip(dynamics_params, dr_range_low, dr_range_high)
-  
+    training_state, state, cumulated_values, key, i = carry
+    key_sgd, key_generate_unroll, param_key, flow_key, new_key = jax.random.split(key, 5)
+    
+    dynamics_params, logp = flowppo_network.flow_network.apply(
+        training_state.params.flow,
+        low=dr_range_low,
+        high=dr_range_high,
+        mode='sample',
+        rng=param_key,
+        n_samples=num_envs // jax.process_count() // local_devices_to_use,
+    )
+    dynamics_params = jax.lax.stop_gradient(dynamics_params)
     state, data = get_experience(training_state, state, dynamics_params, key_generate_unroll, unroll_length, batch_size * num_minibatches // num_envs,)
+    rewards = data.reward * reward_scaling
+    terminal_obs = jax.tree_util.tree_map(lambda x: x[-1], data.next_observation)
+    
     # Have leading dimensions (batch_size * num_minibatches, unroll_length)
     data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
     data = jax.tree_util.tree_map(
         lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
-    )
+    )      # [B * num_minibatches, unroll_length]
     assert data.discount.shape[1:] == (unroll_length,)
-
     if log_training_metrics:  # log unroll metrics
       jax.debug.callback(
           metrics_aggregator.update_episode_metrics,
@@ -578,21 +558,36 @@ def train(
         (),
         length=num_updates_per_batch,
     )
-
+    values = rewards.mean(axis=(0,1)) #+ bootstrap_value
+    cumulated_values += values
+    flow_update_freq = 10
+    def flow_update_fn():
+      target_pdf = jax.nn.log_softmax(-cumulated_values,axis=-1)  # [num_envs]
+      (_, flow_metrics), params, optimizer_state = flow_update_fn(
+          params,
+          dynamics_params,
+          target_pdf,
+          flow_key,
+          optimizer_state=optimizer_state,
+      )
+      return params, optimizer_state
+    params, optimizer_state = jax.lax.cond(i % flow_update_freq==0, \
+                lambda: flow_update_fn(), \
+                 lambda: (params, optimizer_state) )
     new_training_state = TrainingState(
         optimizer_state=optimizer_state,
         params=params,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step,
     )
-    return (new_training_state, state, new_key), metrics
+    return (new_training_state, state, cumulated_values, new_key, i+1), metrics
 
   def training_epoch(
       training_state: TrainingState, state: envs.State, key: PRNGKey
   ) -> Tuple[TrainingState, envs.State, Metrics]:
     (training_state, state, _), loss_metrics = jax.lax.scan(
         training_step,
-        (training_state, state, key),
+        (training_state, state, jnp.zeros(num_envs//jax.process_count()), key, 0),
         (),
         length=num_training_steps_per_epoch,
     )
@@ -658,20 +653,20 @@ def train(
         f,
         (key, dynamics_params_grid), (), length=1#xs=dynamics_params_grid,
     )[1]
-
   evaluation_on_current_occupancy = jax.pmap(
       evaluation_on_current_occupancy, axis_name=_PMAP_AXIS_NAME
   )
   # Initialize model params and training state.
-  init_params = ppo_losses.PPONetworkParams(
-      policy=ppo_network.policy_network.init(key_policy),
-      value=ppo_network.value_network.init(key_value),
+  init_params = flowppo_losses.FLOWPPONetworkParams(
+      policy=flowppo_network.policy_network.init(key_policy),
+      value=flowppo_network.value_network.init(key_value),
+      flow = flowppo_network.flow_network.init(key_flow),
   )
 
   obs_shape = jax.tree_util.tree_map(
       lambda x: specs.Array(x.shape[-1:], jnp.dtype('float32')), env_state.obs
   )
-  print("PPO OBS SHAPE2", obs_shape)
+  print("FLOWPPO OBS SHAPE2", obs_shape)
   training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
       optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
       params=init_params,
@@ -717,27 +712,7 @@ def train(
   )
 
   eval_env = copy.deepcopy(environment)
-  # v_randomization_fn=None
-  # if eval_randomization_fn is not None:
-  #   v_randomization_fn = functools.partial(
-  #       eval_randomization_fn, rng=jax.random.split(eval_key, num_eval_envs), dr_range=env.dr_range
-  #   )
-
-  # eval_env = wrap_for_brax_training(
-  #     eval_env,
-  #     episode_length=episode_length,
-  #     action_repeat=action_repeat,
-  #     randomization_fn=v_randomization_fn,
-  # )  # pytype: disable=wrong-keyword-args
-
-  # evaluator = Evaluator(
-  #     eval_env,
-  #     functools.partial(make_policy, deterministic=True),
-  #     num_eval_envs=num_eval_envs,
-  #     episode_length=episode_length,
-  #     action_repeat=action_repeat,
-  #     key=eval_key,
-  # )
+  v_randomization_fn=None
   v_randomization_fn = functools.partial(
     randomization_fn,
     dr_range=eval_env.dr_range,
@@ -770,16 +745,8 @@ def train(
   # Run initial eval
   metrics = {}
   if process_id == 0 and num_evals > 1 and run_evals:
-    # metrics = evaluator.run_evaluation(
-    #     _unpmap((
-    #         training_state.normalizer_params,
-    #         training_state.params.policy,
-    #         training_state.params.value,
-    #     )),
-    #     training_metrics={},
-    # )
     x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
-                          jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
+                              jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
     dynamics_params_grid = jnp.c_[x.ravel(), y.ravel()]
     metrics, reward_1d = evaluator.run_evaluation(
         _unpmap((
@@ -798,32 +765,45 @@ def train(
     if use_wandb:
       wandb.log({
         'eval on each params' : wandb.Image(eval_fig)
-      }, step=0)
-    if adv_wrapper:
-      evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
-      target_pdf = evaluation_on_current_occupancy(
-          training_state, env_state, evaluation_key
+      }, step=int(0))
+    fig = render_flow_pdf_2d_subplots(
+      flowppo_network.flow_network,
+          _unpmap(training_state.params.flow),
+        low=dr_range_low,
+        high=dr_range_high,
+        training_step=0,
+        use_wandb=use_wandb,
+    )
+    fig = render_flow_pdf_1d_subplots(
+        flowppo_network.flow_network,
+          _unpmap(training_state.params.flow),
+          ndim=dr_range_low.shape[0],
+          low=dr_range_low,
+          high=dr_range_high,
+          training_step=current_step,
+          use_wandb=use_wandb,
       )
-      jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
-      target_pdf = target_pdf.mean(axis=0)
-
-      x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
-                            jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
-      target_lnpdfs = jax.nn.log_softmax(target_pdf, axis=-1)
-      target_lnpdfs = jnp.reshape(target_lnpdfs, x.shape)
-      target_pdfs = jnp.exp(target_lnpdfs)
-      target_entropy = (target_lnpdfs* target_pdfs).mean()
-      target_fig = plt.figure()
-      ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
-      cbar = target_fig.colorbar(ctf)
-      if use_wandb:
-        wandb.log({
-          'target_prob on current occupancy with returns' : wandb.Image(target_fig)
-        }, step=0)
-      metrics.update({'eval/target_entropy': target_entropy})
+    evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
+    target_pdf = evaluation_on_current_occupancy(
+        training_state, env_state, evaluation_key
+    )
+    jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
+    target_pdf = target_pdf.mean(axis=0)
+    x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
+                          jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
+    target_pdfs = jax.nn.log_softmax(target_pdf, axis=-1)
+    target_pdfs = jnp.reshape(target_pdfs, x.shape)
+    target_entropy = target_pdfs.mean()
+    target_fig = plt.figure()
+    ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
+    cbar = target_fig.colorbar(ctf)
+    if use_wandb:
+      wandb.log({
+        'target_prob on current occupancy with returns' : wandb.Image(target_fig)
+      }, step=0)
+    metrics.update({'eval/target entropy': target_entropy})
     logging.info(metrics)
     progress_fn(0, metrics)
-
   # Run initial policy_params_fn.
   params = _unpmap((
       training_state.normalizer_params,
@@ -832,6 +812,7 @@ def train(
   ))
   policy_params_fn(current_step, make_policy, params)
   
+    
   for it in range(num_evals_after_init):
     logging.info('starting iteration %s %s', it, time.time() - xt)
 
@@ -897,31 +878,48 @@ def train(
           wandb.log({
             'eval on each params' : wandb.Image(eval_fig)
           }, step=int(current_step))
-      if adv_wrapper:
-        evaluation_key, local_key = jax.random.split(local_key)
-        evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
-        target_pdf = evaluation_on_current_occupancy(
-            training_state, env_state, evaluation_key
-        )
-        jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
-        target_pdf = target_pdf.mean(0)
+      evaluation_key, local_key = jax.random.split(local_key)
 
-        x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
-                              jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
-        target_lnpdfs = jax.nn.log_softmax(target_pdf, axis=-1)
-        target_lnpdfs = jnp.reshape(target_lnpdfs, x.shape)
-        target_pdfs = jnp.exp(target_lnpdfs)
-        target_entropy = (target_lnpdfs* target_pdfs).mean()
-        target_fig = plt.figure()
-        ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
-        cbar = target_fig.colorbar(ctf)
-        if use_wandb:
-          wandb.log({
-            'target_prob on current occupancy with returns' : wandb.Image(target_fig)
-          }, step=int(current_step))
-        metrics.update({'eval/target_entropy': target_entropy})
+      fig = render_flow_pdf_2d_subplots(
+        flowppo_network.flow_network,
+              _unpmap(training_state.params.flow),
+            low=dr_range_low,
+            high=dr_range_high,
+            training_step=current_step,
+            use_wandb=use_wandb,
+      )
+      fig = render_flow_pdf_1d_subplots(
+          flowppo_network.flow_network,
+            _unpmap(training_state.params.flow),
+            ndim=dr_range_low.shape[0],
+            low=dr_range_low,
+            high=dr_range_high,
+            training_step=current_step,
+            use_wandb=use_wandb,
+        )
+      evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
+      target_pdf = evaluation_on_current_occupancy(
+          training_state, env_state, evaluation_key
+      )
+      jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
+      target_pdf = target_pdf.mean(0)
+
+      x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
+                            jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
+      target_pdfs = jax.nn.log_softmax(target_pdf, axis=-1)
+      target_pdfs = jnp.reshape(target_pdfs, x.shape)
+      target_entropy = target_pdfs.mean()
+      target_fig = plt.figure()
+      ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
+      cbar = target_fig.colorbar(ctf)
+      if use_wandb:
+        wandb.log({
+          'target_prob on current occupancy with returns' : wandb.Image(target_fig)
+        }, step=int(current_step))
+      metrics.update({"eval/target_entropy" : target_entropy})
       logging.info(metrics)
       progress_fn(current_step, metrics)
+
   total_steps = current_step
   if not total_steps >= num_timesteps:
     raise AssertionError(

@@ -31,16 +31,20 @@ from brax.training import pmap
 from brax.training import types
 from brax.training.acme import running_statistics
 from brax.training.acme import specs
-from agents.ppo import checkpoint
-from agents.ppo import losses as ppo_losses
-from agents.ppo import networks as ppo_networks
+from agents.sampler_ppo import checkpoint
+from agents.sampler_ppo import losses as samplerppo_losses
+from agents.sampler_ppo import networks as samplerppo_networks
 from brax.training.types import Params
 from brax.training.types import PRNGKey
 import flax
 import jax
 import jax.numpy as jnp
+from learning.module.gmmvi.network import GMMTrainingState
+from learning.module.normalizing_flow.simple_flow import render_flow_pdf_2d_subplots
+from learning.module.target_examples.funnel import Funnel
 from learning.module.wrapper.adv_wrapper import wrap_for_adv_training
 from learning.module.wrapper.dr_wrapper import wrap_for_dr_training
+import learning.module.gmmvi.utils as gmmvi_utils
 import numpy as np
 import optax
 import wandb
@@ -58,7 +62,8 @@ class TrainingState:
   """Contains training state for the learner."""
 
   optimizer_state: optax.OptState
-  params: ppo_losses.PPONetworkParams
+  params: samplerppo_losses.SAMPLERPPONetworkParams
+  gmm_training_state :GMMTrainingState
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: types.UInt64
 
@@ -187,8 +192,8 @@ def train(
     max_grad_norm: Optional[float] = None,
     normalize_advantage: bool = True,
     network_factory: types.NetworkFactory[
-        ppo_networks.PPONetworks
-    ] = ppo_networks.make_ppo_networks,
+        samplerppo_networks.SAMPLERPPONetworks
+    ] = samplerppo_networks.make_samplerppo_networks,
     seed: int = 0,
     # eval
     num_evals: int = 1,
@@ -210,8 +215,14 @@ def train(
     adv_wrapper = False,
     dr_train_ratio = 1.0,
     use_wandb= False,
+    sampler_update_freq=20,
+    alpha = 0.5,
+    beta = 1.0,
+    tau = 1.0,
+    sampler_choice : int = 0., #(0 : Uniform distribution 1: GOFLOW sampler, 2: flow sampler, 3: GMM sampler)
+    n_sampler_iters : int = 10.,
 ):
-  """PPO training.
+  """SAMPLERPPO training.
 
   Args:
     environment: the environment to train
@@ -235,12 +246,12 @@ def train(
       wrapper.
     randomization_fn: a user-defined callback function that generates randomized
       environments
-    learning_rate: learning rate for ppo loss
-    entropy_cost: entropy reward for ppo loss, higher values increase entropy of
+    learning_rate: learning rate for samplerppo loss
+    entropy_cost: entropy reward for samplerppo loss, higher values increase entropy of
       the policy
     discounting: discounting rate
     unroll_length: the number of timesteps to unroll in each environment. The
-      PPO loss is computed over `unroll_length` timesteps
+      SAMPLERPPO loss is computed over `unroll_length` timesteps
     batch_size: the batch size for each minibatch SGD step
     num_minibatches: the number of times to run the SGD step, each with a
       different minibatch with leading dimension of `batch_size`
@@ -250,7 +261,7 @@ def train(
       eval. The environment resets occur on the host
     normalize_observations: whether to normalize observations
     reward_scaling: float scaling for reward
-    clipping_epsilon: clipping epsilon for PPO loss
+    clipping_epsilon: clipping epsilon for SAMPLERPPO loss
     gae_lambda: General advantage estimation lambda
     max_grad_norm: gradient clipping norm value. If None, no clipping is done
     normalize_advantage: whether to normalize advantage estimate
@@ -275,7 +286,7 @@ def train(
     restore_checkpoint_path: the path used to restore previous model params
     restore_params: raw network parameters to restore the TrainingState from.
       These override `restore_checkpoint_path`. These paramaters can be obtained
-      from the return values of ppo.train().
+      from the return values of samplerppo.train().
     restore_value_fn: whether to restore the value function from the checkpoint
       or use a random initialization
     run_evals: if True, use the evaluator num_eval times to collect distinct
@@ -285,13 +296,13 @@ def train(
   Returns:
     Tuple of (make_policy function, network params, metrics)
   """
+  num_envs = 1024
   assert batch_size * num_minibatches % num_envs == 0
   _validate_madrona_args(
       madrona_backend, num_envs, num_eval_envs, action_repeat, eval_env
   )
 
   xt = time.time()
-
   process_count = jax.process_count()
   process_id = jax.process_index()
   local_device_count = jax.local_device_count()
@@ -308,7 +319,7 @@ def train(
       local_devices_to_use,
   )
   device_count = local_devices_to_use * process_count
-
+  print("sgd steps per env step",  batch_size * num_minibatches // num_envs)
   # The number of environment steps executed for every training step.
   env_step_per_training_step = (
       batch_size * unroll_length * num_minibatches * action_repeat
@@ -333,7 +344,7 @@ def train(
   local_key, key_env, eval_key = jax.random.split(local_key, 3)
   # key_networks should be global, so that networks are initialized the same
   # way for different processes.
-  key_policy, key_wrap, key_value = jax.random.split(global_key, 3)
+  key_policy, key_wrap, key_value, gmm_key = jax.random.split(global_key, 4)
   del global_key
 
   assert num_envs % device_count == 0
@@ -341,52 +352,29 @@ def train(
   env = copy.deepcopy(environment)
 
   if hasattr(env,'dr_range') :
-    dr_range_low, dr_range_high = env.dr_range
-    dr_mid = (dr_range_low + dr_range_high) / 2.
-    dr_scale = (dr_range_high - dr_range_low) / 2.
-    training_dr_range = (dr_mid - dr_train_ratio*dr_scale, dr_mid + dr_train_ratio*dr_scale)
+    low, high = env.dr_range
+    dr_mid = (low  + high) / 2.
+    dr_scale = dr_train_ratio * (high - low) / 2.
+    dr_range_low, dr_range_high = dr_mid - dr_train_ratio*dr_scale, dr_mid + dr_train_ratio*dr_scale
+    training_dr_range = (dr_range_low,  dr_range_high)
   else:
     training_dr_range = None
   training_randomization_fn = None
 
-  if adv_wrapper and randomization_fn is not None:
-    training_randomization_fn = functools.partial(
-          randomization_fn,
-          dr_range=training_dr_range,
-      )
-    if adv_wrapper:
-        env = wrap_for_adv_training(
-          env,
-          episode_length=episode_length,
-          action_repeat=action_repeat,
-          randomization_fn=training_randomization_fn,
-          param_size = len(dr_range_low),
-          dr_range_low=dr_range_low,
-          dr_range_high=dr_range_high,
-        )
-    else:
-      env = wrap_for_dr_training(#wrap_for_training(
-          env,
-          episode_length=episode_length,
-          action_repeat=action_repeat,
-          randomization_fn=training_randomization_fn,
-          n_nominals=1,
-          n_envs=num_envs,
-      )  # pytype: disable=wrong-keyword-args
-
-  else:
-    v_randomization_fn = functools.partial(
-        eval_randomization_fn,
-          rng=jax.random.split(
-              key_wrap, num_envs // jax.process_count() // local_devices_to_use),\
-                  dr_range=training_dr_range
-    ) if eval_randomization_fn is not None else None
-    env = wrap_for_brax_training(
-      env,
-        episode_length=episode_length,
-        action_repeat=action_repeat,
-        randomization_fn=v_randomization_fn,
+  training_randomization_fn = functools.partial(
+        randomization_fn,
+        dr_range=training_dr_range,
     )
+  env = wrap_for_adv_training(
+    env,
+    episode_length=episode_length,
+    action_repeat=action_repeat,
+    randomization_fn=training_randomization_fn,
+    param_size = len(dr_range_low),
+    dr_range_low=dr_range_low,
+    dr_range_high=dr_range_high,
+  )
+
   key_envs = jax.random.split(key_env, num_envs // process_count)
   key_envs = jnp.reshape(
       key_envs, (local_devices_to_use, -1) + key_envs.shape[1:]
@@ -394,16 +382,25 @@ def train(
   env_state= jax.pmap(env.reset)(key_envs)
   # Discard the batch axes over devices and envs.
   obs_shape = jax.tree_util.tree_map(lambda x: x.shape[2:], env_state.obs)
-  print("PPO OBS SIZE", obs_shape)
-  normalize = lambda x, y: x
+  print("SAMPLERPPO OBS SIZE", obs_shape)
+  normalize_fn = lambda x, y: x
+  gmm_batch_size= 1024#batch_size * num_minibatches
   if normalize_observations:
-    normalize = running_statistics.normalize
-  ppo_network = network_factory(
-      obs_shape, env.action_size, preprocess_observations_fn=normalize
+    normalize_fn = running_statistics.normalize
+  samplerppo_network, init_gmm_state = network_factory(
+    observation_size = obs_shape,
+    action_size= env.action_size, 
+    dynamics_param_size=len(dr_range_low), 
+    batch_size= gmm_batch_size,
+    num_envs = num_envs//jax.process_count(),
+    init_key=gmm_key,
+    preprocess_observations_fn=normalize_fn,
+    bound_info = training_dr_range,
   )
-  make_policy = ppo_networks.make_inference_fn(ppo_network)
+  make_policy = samplerppo_networks.make_inference_fn(samplerppo_network)
 
   optimizer = optax.adam(learning_rate=learning_rate)
+  flow_optimizer = optax.adam(learning_rate=learning_rate)
   if max_grad_norm is not None:
     # TODO: Move gradient clipping to `training/gradients.py`.
     optimizer = optax.chain(
@@ -412,8 +409,8 @@ def train(
     )
 
   loss_fn = functools.partial(
-      ppo_losses.compute_ppo_loss,
-      ppo_network=ppo_network,
+      samplerppo_losses.compute_samplerppo_loss,
+      samplerppo_network=samplerppo_network,
       entropy_cost=entropy_cost,
       discounting=discounting,
       reward_scaling=reward_scaling,
@@ -422,14 +419,36 @@ def train(
       normalize_advantage=normalize_advantage,
   )
   gae_fn = functools.partial(
-      ppo_losses.compute_gae,
+      samplerppo_losses.compute_gae,
       lambda_=gae_lambda,
       discount=discounting,
   )
+  flowloss_fn = functools.partial(
+    samplerppo_losses.flow_loss,
+    samplerppo_network=samplerppo_network,
+    dr_range_high=dr_range_high,
+    dr_range_low=dr_range_low,
+    alpha=alpha,
+    beta=beta,
+  )
+  goflowloss_fn = functools.partial(
+    samplerppo_losses.goflow_loss,
+    samplerppo_network=samplerppo_network,
+    dr_range_high=dr_range_high,
+    dr_range_low=dr_range_low,
+    alpha=alpha,
+    beta=beta,
+  )
+  gmm_update_fn = samplerppo_losses.make_gmm_update(samplerppo_network.gmm_network)
   gradient_update_fn = gradients.gradient_update_fn(
       loss_fn, optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
   )
-
+  flow_update_fn = gradients.gradient_update_fn(
+    flowloss_fn, flow_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+  )
+  goflow_update_fn = gradients.gradient_update_fn(
+    goflowloss_fn, flow_optimizer, pmap_axis_name=_PMAP_AXIS_NAME, has_aux=True
+  )
   metrics_aggregator = metric_logger.EpisodeMetricsLogger(
       steps_between_logging=training_metrics_steps
       or env_step_per_training_step,
@@ -438,11 +457,11 @@ def train(
 
   def minibatch_step(
       carry,
-      data: types.Transition,
+      data,
       normalizer_params: running_statistics.RunningStatisticsState,
   ):
     optimizer_state, params, key = carry
-    key, key_loss = jax.random.split(key)
+    key, key_loss = jax.random.split(key, 2)
     (_, metrics), params, optimizer_state = gradient_update_fn(
         params,
         normalizer_params,
@@ -450,7 +469,7 @@ def train(
         key_loss,
         optimizer_state=optimizer_state,
     )
-
+    
     return (optimizer_state, params, key), metrics
 
   def sgd_step(
@@ -473,7 +492,6 @@ def train(
           next_observation=r_translate(data.next_observation),
           extras=data.extras,
       )
-
     def convert_data(x: jnp.ndarray):
       x = jax.random.permutation(key_perm, x)
       x = jnp.reshape(x, (num_minibatches, -1) + x.shape[1:])
@@ -487,6 +505,7 @@ def train(
         length=num_minibatches,
     )
     return (optimizer_state, params, key), metrics
+  
   def get_experience(
       training_state,
       state,
@@ -500,36 +519,19 @@ def train(
         training_state.params.policy,
         training_state.params.value,
     ))
-    if adv_wrapper:
-      print("dynamics params", dynamics_params)
-      # dynamics_params = env_state.info["dr_params"] * (1 - env_state.done[..., None]) + dynamics_params[None, ...] * env_state.done[..., None]
-      def f(carry, unused_t):
-        current_state, current_key = carry
-        current_key, next_key = jax.random.split(current_key)
-        next_state, data = generate_adv_unroll(
-            env,
-            current_state,
-            dynamics_params.squeeze(),
-            policy,
-            current_key,
-            unroll_length,
-            extra_fields=('truncation', 'episode_metrics', 'episode_done'),
-        )
-        return (next_state, next_key), data
-    else:
-      def f(carry, unused_t):
-        current_state, current_key = carry
-        current_key, next_key = jax.random.split(current_key)
-        next_state, data = acting.generate_unroll(
-            env,
-            current_state,
-            policy,
-            current_key,
-            unroll_length,
-            extra_fields=('truncation', 'episode_metrics', 'episode_done'),
-        )
-        return (next_state, next_key), data
-
+    def f(carry, unused_t):
+      current_state, current_key = carry
+      current_key, next_key = jax.random.split(current_key)
+      next_state, data = generate_adv_unroll(
+          env,
+          current_state,
+          dynamics_params,
+          policy,
+          current_key,
+          unroll_length,
+          extra_fields=('truncation', 'episode_metrics', 'episode_done'),
+      )
+      return (next_state, next_key), data
     (state, _), data = jax.lax.scan(
         f,
         (state, key_generate_unroll),
@@ -540,22 +542,26 @@ def train(
   def training_step(
       carry: Tuple[TrainingState, envs.State, PRNGKey], unused_t
   ) -> Tuple[Tuple[TrainingState, envs.State, PRNGKey], Metrics]:
-    training_state, state, key = carry
-    key_sgd, key_generate_unroll, param_key,  new_key = jax.random.split(key, 4)
-    dynamics_params = jax.random.uniform(key=param_key, shape=(num_envs//jax.process_count(),len(dr_range_low)), minval=dr_range_low, maxval=dr_range_high)
+    training_state, state, cumulated_values, key, i = carry
+    key_sgd, key_generate_unroll, param_key, key_gmm, key_flow, new_key = jax.random.split(key, 6)
+    
+    dynamics_params, mapping = samplerppo_network.sampler_network.sample_selector.select_samples(\
+              training_state.sampler_training_state.model_state, param_key)
+    # #for debugging
     # dynamics_params = (dr_range_low + dr_range_high)/2 +\
     #   jax.random.normal(key=param_key, shape=(num_envs//jax.process_count(),len(dr_range_low)))\
     #     * (dr_range_high - dr_range_low)/100
     # dynamics_params = jnp.clip(dynamics_params, dr_range_low, dr_range_high)
-  
+
     state, data = get_experience(training_state, state, dynamics_params, key_generate_unroll, unroll_length, batch_size * num_minibatches // num_envs,)
+
+    rewards = data.reward     #(K, L, B)
     # Have leading dimensions (batch_size * num_minibatches, unroll_length)
     data = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 1, 2), data)
     data = jax.tree_util.tree_map(
         lambda x: jnp.reshape(x, (-1,) + x.shape[2:]), data
-    )
+    )      # [B * num_minibatches, unroll_length]
     assert data.discount.shape[1:] == (unroll_length,)
-
     if log_training_metrics:  # log unroll metrics
       jax.debug.callback(
           metrics_aggregator.update_episode_metrics,
@@ -579,24 +585,100 @@ def train(
         length=num_updates_per_batch,
     )
 
+    values = rewards.mean(axis=(0,1)) #+ bootstrap_value
+    cumulated_values += values
+    # For Debuggin GMM
+    # target = Funnel(dim=2, sample_bounds=[-30, 30])
+    # target_logprob = jax.vmap(target.log_prob)
+    # target_pdf = target_logprob(dynamics_params - (dr_range_low + dr_range_high)/2) # [num_envs]
+    gmm_training_state = training_state.gmm_training_state
+    def update_flow():
+      self_normalized_values = (cumulated_values - cumulated_values.mean())/(cumulated_values.mean() +1e-8 ) 
+      target_lnpdf = jnp.log(self_normalized_values)
+      def body(carry, _):
+        params, optimizer_state = carry
+        (_, flow_metrics), params, optimizer_state = goflow_update_fn(
+            params,
+            dynamics_params,
+            target_lnpdf,
+            key_flow,
+            optimizer_state=optimizer_state,
+        )
+        return (params, optimizer_state), None
+      (params, optimizer_state), _  = jax.lax.scan(body, (params, optimizer_state), (), length=n_sampler_iters)
+      return params, optimizer_state, 1.
+    def update_goflow():
+      self_normalized_values = (cumulated_values - cumulated_values.mean())/(cumulated_values.mean() +1e-8 ) 
+      target_lnpdf = jnp.log(self_normalized_values)
+      def body(carry, _):
+        params, optimizer_state = carry
+        (_, flow_metrics), params, optimizer_state = goflow_update_fn(
+            params,
+            dynamics_params,
+            target_lnpdf,
+            key_flow,
+            optimizer_state=optimizer_state,
+        )
+        return (params, optimizer_state), None
+      (params, optimizer_state), _  = jax.lax.scan(body, (params, optimizer_state), (), length=n_sampler_iters)
+      return params, optimizer_state, 1.
+    def update_gmm():
+      self_normalized_values = (cumulated_values - cumulated_values.mean())/(cumulated_values.mean() +1e-8 ) 
+      target_lnpdf = jax.nn.log_softmax(-tau * self_normalized_values,axis=-1)  # [num_envs]
+      new_sample_db_state = samplerppo_network.gmm_network.sample_selector.save_samples(training_state.gmm_training_state.model_state, \
+                    training_state.gmm_training_state.sample_db_state, dynamics_params, target_lnpdf, \
+                      jnp.zeros_like(dynamics_params), mapping)
+      new_gmm_training_state = training_state.gmm_training_state._replace(sample_db_state=new_sample_db_state)
+      new_gmm_training_state = gmm_update_fn(new_gmm_training_state, key_gmm)
+
+      return new_gmm_training_state, 1.
+    if sampler_choice==0:
+      None
+    elif sampler_choice==1:
+      optimizer_state, params, update_signal = jax.lax.cond(i % sampler_update_freq==0, \
+                lambda: update_goflow(), \
+                 lambda: (optimizer_state, params, 0.) )
+    elif sampler_choice==2:
+            optimizer_state, params, update_signal = jax.lax.cond(i % sampler_update_freq==0, \
+                lambda: update_flow(), \
+                 lambda: (optimizer_state, params, 0.) )
+    elif sampler_choice==3:
+      gmm_training_state, update_signal = jax.lax.cond(i % sampler_update_freq==0, \
+                  lambda: update_gmm(), \
+                  lambda: (training_state.gmm_training_state, 0.) )
+    else:
+      raise ValueError("No Sampler!")
+    metrics.update({
+      'target_pdf_min': update_signal* cumulated_values.min(),
+      'target_pdf_max': update_signal* cumulated_values.max(),
+      'target_pdf_mean': update_signal* cumulated_values.mean(),
+      'target_pdf_q25': update_signal* jnp.quantile(cumulated_values, .25),
+      'target_pdf_q50': update_signal* jnp.quantile(cumulated_values, .50),
+      'target_pdf_q75': update_signal* jnp.quantile(cumulated_values, .75),
+      'target_pdf_std': update_signal* cumulated_values.std(),
+    })
     new_training_state = TrainingState(
         optimizer_state=optimizer_state,
         params=params,
+        gmm_training_state=gmm_training_state,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step,
     )
-    return (new_training_state, state, new_key), metrics
+    return (new_training_state, state, cumulated_values, new_key, i+1), metrics
 
   def training_epoch(
       training_state: TrainingState, state: envs.State, key: PRNGKey
   ) -> Tuple[TrainingState, envs.State, Metrics]:
-    (training_state, state, _), loss_metrics = jax.lax.scan(
+    (training_state, state, _, _, _), loss_metrics = jax.lax.scan(
         training_step,
-        (training_state, state, key),
+        (training_state, state, jnp.zeros(num_envs//jax.process_count()), key, 0),
         (),
         length=num_training_steps_per_epoch,
     )
     loss_metrics = jax.tree_util.tree_map(jnp.mean, loss_metrics)
+    for k, v in loss_metrics.items():
+      if 'target_pdf' in k:
+        loss_metrics[k] *=sampler_update_freq
     return training_state, state, loss_metrics
 
   training_epoch = jax.pmap(training_epoch, axis_name=_PMAP_AXIS_NAME)
@@ -633,6 +715,7 @@ def train(
       key: PRNGKey,
   ) -> Tuple[TrainingState, envs.State, PRNGKey]:
     # shape = np.sqrt(num_envs).astype(int)
+    value_apply = samplerppo_network.value_network.apply
     x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
                           jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
     dynamics_params_grid = jnp.c_[x.ravel(), y.ravel()]
@@ -647,10 +730,11 @@ def train(
           dynamics_params_grid,
           key,
           unroll_length,
-          batch_size * num_minibatches // num_envs * 10 ,
+          batch_size * num_minibatches // num_envs * sampler_update_freq ,
       )
       rewards = datas.reward * reward_scaling
       terminal_obs = jax.tree_util.tree_map(lambda x: x[:, -1], datas.next_observation)
+      bootstrap_value = value_apply(training_state.normalizer_params, training_state.params.value, terminal_obs)
       values = rewards.mean(axis=(0,1))# + bootstrap_value
       # vs, advantages = jax.vmap(gae_fn)(truncation, termination, rewards, baseline, bootstrap_value)
       return (new_key, dynamics_params_grid), values#pdf_values
@@ -658,23 +742,23 @@ def train(
         f,
         (key, dynamics_params_grid), (), length=1#xs=dynamics_params_grid,
     )[1]
-
   evaluation_on_current_occupancy = jax.pmap(
       evaluation_on_current_occupancy, axis_name=_PMAP_AXIS_NAME
   )
   # Initialize model params and training state.
-  init_params = ppo_losses.PPONetworkParams(
-      policy=ppo_network.policy_network.init(key_policy),
-      value=ppo_network.value_network.init(key_value),
+  init_params = samplerppo_losses.SAMPLERPPONetworkParams(
+      policy=samplerppo_network.policy_network.init(key_policy),
+      value=samplerppo_network.value_network.init(key_value),
   )
 
   obs_shape = jax.tree_util.tree_map(
       lambda x: specs.Array(x.shape[-1:], jnp.dtype('float32')), env_state.obs
   )
-  print("PPO OBS SHAPE2", obs_shape)
+  print("SAMPLERPPO OBS SHAPE2", obs_shape)
   training_state = TrainingState(  # pytype: disable=wrong-arg-types  # jax-ndarray
       optimizer_state=optimizer.init(init_params),  # pytype: disable=wrong-arg-types  # numpy-scalars
       params=init_params,
+      gmm_training_state=init_gmm_state,
       normalizer_params=running_statistics.init_state(
           _remove_pixels(obs_shape)
       ),
@@ -717,27 +801,7 @@ def train(
   )
 
   eval_env = copy.deepcopy(environment)
-  # v_randomization_fn=None
-  # if eval_randomization_fn is not None:
-  #   v_randomization_fn = functools.partial(
-  #       eval_randomization_fn, rng=jax.random.split(eval_key, num_eval_envs), dr_range=env.dr_range
-  #   )
-
-  # eval_env = wrap_for_brax_training(
-  #     eval_env,
-  #     episode_length=episode_length,
-  #     action_repeat=action_repeat,
-  #     randomization_fn=v_randomization_fn,
-  # )  # pytype: disable=wrong-keyword-args
-
-  # evaluator = Evaluator(
-  #     eval_env,
-  #     functools.partial(make_policy, deterministic=True),
-  #     num_eval_envs=num_eval_envs,
-  #     episode_length=episode_length,
-  #     action_repeat=action_repeat,
-  #     key=eval_key,
-  # )
+  v_randomization_fn=None
   v_randomization_fn = functools.partial(
     randomization_fn,
     dr_range=eval_env.dr_range,
@@ -770,16 +834,8 @@ def train(
   # Run initial eval
   metrics = {}
   if process_id == 0 and num_evals > 1 and run_evals:
-    # metrics = evaluator.run_evaluation(
-    #     _unpmap((
-    #         training_state.normalizer_params,
-    #         training_state.params.policy,
-    #         training_state.params.value,
-    #     )),
-    #     training_metrics={},
-    # )
     x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
-                          jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
+                              jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
     dynamics_params_grid = jnp.c_[x.ravel(), y.ravel()]
     metrics, reward_1d = evaluator.run_evaluation(
         _unpmap((
@@ -798,32 +854,61 @@ def train(
     if use_wandb:
       wandb.log({
         'eval on each params' : wandb.Image(eval_fig)
-      }, step=0)
-    if adv_wrapper:
-      evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
-      target_pdf = evaluation_on_current_occupancy(
-          training_state, env_state, evaluation_key
+      }, step=int(0))
+    if sampler_choice == 1 or sampler_choice ==2:
+      fig = render_flow_pdf_2d_subplots(
+        samplerppo_network.flow_network,
+          _unpmap(training_state.params.flow),
+        low=dr_range_low,
+        high=dr_range_high,
+        training_step=current_step,
+        use_wandb=use_wandb,
       )
-      jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
-      target_pdf = target_pdf.mean(axis=0)
-
-      x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
-                            jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
-      target_lnpdfs = jax.nn.log_softmax(target_pdf, axis=-1)
-      target_lnpdfs = jnp.reshape(target_lnpdfs, x.shape)
-      target_pdfs = jnp.exp(target_lnpdfs)
-      target_entropy = (target_lnpdfs* target_pdfs).mean()
-      target_fig = plt.figure()
-      ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
-      cbar = target_fig.colorbar(ctf)
+    elif sampler_choice==3:
+      sample_key1, sample_key2, local_key = jax.random.split(local_key, 3)
+      samples = samplerppo_network.gmm_network.model.sample_from_components_no_shuffle(_unpmap(\
+        training_state.gmm_training_state.model_state.gmm_state), 1000, \
+          _unpmap(training_state.gmm_training_state.model_state.gmm_state.num_components), sample_key1)[0]
+      eval_samples = samplerppo_network.gmm_network.model.sample(_unpmap(\
+        training_state.gmm_training_state.model_state.gmm_state), sample_key2, 1000)[0]
+      
+      log_prob_fn = jax.vmap(functools.partial(samplerppo_network.gmm_network.model.log_density,\
+                  gmm_state=_unpmap(training_state.gmm_training_state.model_state.gmm_state)))
+      model_fig, model_fig_raw = gmmvi_utils.visualise(
+        log_prob_fn,
+        dr_range_low,
+        dr_range_high,
+        samples,
+        eval_samples,
+        bijector_log_prob=jax.vmap(samplerppo_network.gmm_network.model.bijector_log_prob)
+      )
       if use_wandb:
-        wandb.log({
-          'target_prob on current occupancy with returns' : wandb.Image(target_fig)
-        }, step=0)
-      metrics.update({'eval/target_entropy': target_entropy})
+        wandb.log(
+                {"model" :wandb.Image(model_fig)},
+                step=int(0),
+            )
+    evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
+    target_pdf = evaluation_on_current_occupancy(
+        training_state, env_state, evaluation_key
+    )
+    jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
+    target_pdf = target_pdf.mean(axis=0)
+
+    x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
+                          jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
+    target_pdfs = jax.nn.log_softmax(target_pdf, axis=-1)
+    target_pdfs = jnp.reshape(target_pdfs, x.shape)
+    target_entropy = target_pdfs.mean()
+    target_fig = plt.figure()
+    ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
+    cbar = target_fig.colorbar(ctf)
+    if use_wandb:
+      wandb.log({
+        'target_prob on current occupancy with returns' : wandb.Image(target_fig)
+      }, step=0)
+    metrics.update({'eval/target entropy': target_entropy})
     logging.info(metrics)
     progress_fn(0, metrics)
-
   # Run initial policy_params_fn.
   params = _unpmap((
       training_state.normalizer_params,
@@ -832,6 +917,7 @@ def train(
   ))
   policy_params_fn(current_step, make_policy, params)
   
+    
   for it in range(num_evals_after_init):
     logging.info('starting iteration %s %s', it, time.time() - xt)
 
@@ -897,31 +983,53 @@ def train(
           wandb.log({
             'eval on each params' : wandb.Image(eval_fig)
           }, step=int(current_step))
-      if adv_wrapper:
-        evaluation_key, local_key = jax.random.split(local_key)
-        evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
-        target_pdf = evaluation_on_current_occupancy(
-            training_state, env_state, evaluation_key
+      evaluation_key, local_key = jax.random.split(local_key)
+      if sampler_choice==3:
+        sample_key1, sample_key2, local_key = jax.random.split(local_key, 3)
+        samples = samplerppo_network.gmm_network.model.sample_from_component_no_shuffle(_unpmap(\
+          training_state.gmm_training_state.model_state.gmm_state), 1000, \
+            _unpmap(training_state.gmm_training_state.model_state.gmm_state.num_components), sample_key1)[0]
+        eval_samples = samplerppo_network.gmm_network.model.sample(_unpmap(\
+          training_state.gmm_training_state.model_state.gmm_state), sample_key2, 1000)[0]
+        
+        log_prob_fn = jax.vmap(functools.partial(samplerppo_network.gmm_network.model.log_density,\
+                    gmm_state=_unpmap(training_state.gmm_training_state.model_state.gmm_state)))
+        model_fig, model_fig_raw = gmmvi_utils.visualise(
+          log_prob_fn,
+          dr_range_low,
+          dr_range_high,
+          samples,
+          eval_samples,
+          bijector_log_prob=jax.vmap(samplerppo_network.gmm_network.model.bijector_log_prob)
         )
-        jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
-        target_pdf = target_pdf.mean(0)
-
-        x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
-                              jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
-        target_lnpdfs = jax.nn.log_softmax(target_pdf, axis=-1)
-        target_lnpdfs = jnp.reshape(target_lnpdfs, x.shape)
-        target_pdfs = jnp.exp(target_lnpdfs)
-        target_entropy = (target_lnpdfs* target_pdfs).mean()
-        target_fig = plt.figure()
-        ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
-        cbar = target_fig.colorbar(ctf)
         if use_wandb:
-          wandb.log({
-            'target_prob on current occupancy with returns' : wandb.Image(target_fig)
-          }, step=int(current_step))
-        metrics.update({'eval/target_entropy': target_entropy})
+          wandb.log(
+                  {"model" :wandb.Image(model_fig)},
+                  step=int(current_step),
+              )
+      evaluation_key = jax.random.split(evaluation_key, local_devices_to_use)
+      target_pdf = evaluation_on_current_occupancy(
+          training_state, env_state, evaluation_key
+      )
+      jax.tree_util.tree_map(lambda x: x.block_until_ready(), target_pdf)
+      target_pdf = target_pdf.mean(0)
+
+      x, y = jnp.meshgrid(jnp.linspace(dr_range_low[0], dr_range_high[0], 32),\
+                            jnp.linspace(dr_range_low[1], dr_range_high[1], 32))
+      target_pdfs = jax.nn.log_softmax(target_pdf, axis=-1)
+      target_pdfs = jnp.reshape(target_pdfs, x.shape)
+      target_entropy = target_pdfs.mean()
+      target_fig = plt.figure()
+      ctf = plt.contourf(x, y, target_pdfs, levels=20, cmap='viridis')
+      cbar = target_fig.colorbar(ctf)
+      if use_wandb:
+        wandb.log({
+          'target_prob on current occupancy with returns' : wandb.Image(target_fig)
+        }, step=int(current_step))
+      metrics.update({"eval/target_entropy" : target_entropy})
       logging.info(metrics)
       progress_fn(current_step, metrics)
+
   total_steps = current_step
   if not total_steps >= num_timesteps:
     raise AssertionError(
