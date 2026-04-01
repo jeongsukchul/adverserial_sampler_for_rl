@@ -1,8 +1,14 @@
-wandb_project="cheetah-sampler2"
-for beta in 0 0.5 1 2
+wandb_project=walker-sampler3
+task=WalkerWalk
+success_threshold=.7
+
+for beta in 10 2 1 0.66 0.5
+do
+for gamma in 0. .5 1. 2.
+do
+    for seed in 0 1 2 3 4 5
     do
-    for seed in 0 1 2 3 4
-    do
-        python train.py policy=flowppo beta=$beta wandb_project=$wandb_project n_sampler_iters=30 seed=$seed
+       python run.py policy=flowppo task=$task wandb_project=$wandb_project beta=$beta gamma=$gamma seed=$seed 
     done
-    done
+done
+done

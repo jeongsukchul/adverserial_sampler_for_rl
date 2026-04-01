@@ -111,10 +111,14 @@ def make_samplerppo_networks(
   )
   print("num envs", num_envs)
   print('batch size', batch_size)
+  if dynamics_param_size < 20:
+    num_components= 20
+  else:
+    num_components= 30
   init_gmmvi_state, gmm_network = create_gmm_network_and_state(dynamics_param_size, \
                                                                num_envs, batch_size, init_key,\
                                                                prior_scale=.1,
-                                                                bound_info=bound_info)
+                                                                bound_info=bound_info, num_components=num_components)
   dr_low, dr_high = bound_info
   init_fn, autodr_update_fn = make_adr_update_fn(
     domain_low=dr_low,
